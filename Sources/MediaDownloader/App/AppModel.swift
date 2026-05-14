@@ -1,0 +1,314 @@
+import AppKit
+import Foundation
+
+@MainActor
+final class AppModel: ObservableObject {
+    @Published var inputText = ""
+    @Published private(set) var history: [DownloadItem] = []
+    @Published private(set) var isDownloading = false
+    @Published var statusMessage: String?
+    @Published var activeTrimSession: ActiveTrimSession?
+    @Published private(set) var isCheckingForUpdates = false
+    @Published var pendingQualitySelection: PendingDownload?
+
+    struct PendingDownload {
+        let sourceURL: String
+        var selectedQuality: VideoQuality
+    }
+
+    private let preferences = PreferencesStore()
+    private let historyStore = HistoryStore()
+    private let downloader = MediaDownloaderService()
+    private let thumbnailGenerator = ThumbnailGenerator()
+    private let trimExporter = TrimExportService()
+    private let updateChecker = UpdateChecker()
+    private var pasteTask: Task<Void, Never>?
+    private var didRunAutomaticUpdateCheck = false
+    private var settingsWindowController: SettingsWindowController?
+
+    var downloadFolderPath: String {
+        preferences.downloadFolder.path
+    }
+
+    init() {
+        history = historyStore.load()
+    }
+
+    func chooseDownloadFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = preferences.downloadFolder
+        panel.prompt = "Choose"
+
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
+
+        preferences.downloadFolder = url
+    }
+
+    func handlePasteCandidate() {
+        pasteTask?.cancel()
+
+        let candidate = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard URLValidator.looksLikeWebURL(candidate) else {
+            return
+        }
+
+        pasteTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled else { return }
+            await self?.startDownloadIfNeeded(candidate)
+        }
+    }
+
+    func submitInput() {
+        pasteTask?.cancel()
+        Task { [weak self] in
+            guard let self else { return }
+            await self.startDownloadIfNeeded(self.inputText)
+        }
+    }
+
+    func copyFile(_ item: DownloadItem) {
+        ClipboardService.copyFile(URL(fileURLWithPath: item.filePath))
+        statusMessage = "Copied \(item.displayName)."
+    }
+
+    func revealInFinder(_ item: DownloadItem) {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.filePath)])
+    }
+
+    func openSourceURL(_ item: DownloadItem) {
+        guard let url = URL(string: item.sourceURL) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func deleteHistoryItem(_ item: DownloadItem) {
+        history.removeAll { $0.id == item.id }
+        if !historyStore.save(history) {
+            statusMessage = "Could not save history changes."
+        }
+
+        if activeTrimSession?.item.id == item.id {
+            activeTrimSession = nil
+        }
+    }
+
+    func clearHistory() {
+        history.removeAll()
+        if !historyStore.save(history) {
+            statusMessage = "Could not save history changes."
+        }
+        activeTrimSession = nil
+    }
+
+    func checkForUpdates(manual: Bool) {
+        if !manual {
+            guard !didRunAutomaticUpdateCheck else { return }
+            didRunAutomaticUpdateCheck = true
+        }
+
+        guard !isCheckingForUpdates else { return }
+        isCheckingForUpdates = true
+
+        Task { [weak self] in
+            guard let self else { return }
+
+            do {
+                let currentVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
+                let result = try await updateChecker.check(currentVersion: currentVersion)
+                let downloadedUpdate: DownloadedUpdate?
+
+                if case .updateAvailable(let update) = result {
+                    downloadedUpdate = try await updateChecker.download(update)
+                } else {
+                    downloadedUpdate = nil
+                }
+
+                await MainActor.run {
+                    self.isCheckingForUpdates = false
+                    self.presentUpdateResult(
+                        result,
+                        downloadedUpdate: downloadedUpdate,
+                        currentVersion: currentVersion,
+                        manual: manual
+                    )
+                }
+            } catch {
+                await MainActor.run {
+                    self.isCheckingForUpdates = false
+                    if manual {
+                        self.presentUpdateError(error)
+                    }
+                }
+            }
+        }
+    }
+
+    func showSettings() {
+        if settingsWindowController == nil {
+            settingsWindowController = SettingsWindowController(
+                preferences: preferences,
+                onCheckForUpdates: { [weak self] in
+                    self?.checkForUpdates(manual: true)
+                }
+            )
+        }
+
+        settingsWindowController?.show()
+    }
+
+    func hotKeyShortcut(for action: HotKeyAction) -> HotKeyShortcut {
+        preferences.hotKeyShortcut(for: action)
+    }
+
+    func editTrim(_ item: DownloadItem) {
+        activeTrimSession = ActiveTrimSession(item: item)
+    }
+
+    func closeTrim() {
+        activeTrimSession = nil
+    }
+
+    func saveActiveTrim(_ selection: TrimSelection, to outputURL: URL, onProgress: @Sendable @escaping (Double) -> Void) async throws -> URL {
+        guard let session = activeTrimSession else {
+            throw TrimExportError.invalidRange
+        }
+
+        return try await trimExporter.exportTrim(
+            sourceURL: session.fileURL,
+            selection: selection,
+            to: outputURL,
+            onProgress: onProgress
+        )
+    }
+
+    func copyActiveTrim(_ selection: TrimSelection, onProgress: @Sendable @escaping (Double) -> Void) async throws {
+        guard let session = activeTrimSession else {
+            throw TrimExportError.invalidRange
+        }
+
+        let outputURL = try await trimExporter.temporaryURL(for: session.fileURL)
+        let trimmedURL = try await trimExporter.exportTrim(
+            sourceURL: session.fileURL,
+            selection: selection,
+            to: outputURL,
+            onProgress: onProgress
+        )
+        ClipboardService.copyFile(trimmedURL)
+    }
+
+    func confirmQualityAndDownload() {
+        guard let pending = pendingQualitySelection else { return }
+        pendingQualitySelection = nil
+        Task { await executeDownload(sourceURL: pending.sourceURL, quality: pending.selectedQuality) }
+    }
+
+    func cancelQualitySelection() {
+        pendingQualitySelection = nil
+    }
+
+    private func startDownloadIfNeeded(_ rawURL: String) async {
+        let sourceURL = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isDownloading else { return }
+        guard URLValidator.looksLikeWebURL(sourceURL) else {
+            statusMessage = "Enter a valid URL."
+            return
+        }
+
+        if let message = URLValidator.unsupportedPlatformMessage(for: sourceURL) {
+            statusMessage = message
+            return
+        }
+
+        if preferences.alwaysUseDefaultQuality {
+            await executeDownload(sourceURL: sourceURL, quality: preferences.defaultQuality)
+        } else {
+            pendingQualitySelection = PendingDownload(
+                sourceURL: sourceURL,
+                selectedQuality: preferences.defaultQuality
+            )
+        }
+    }
+
+    private func executeDownload(sourceURL: String, quality: VideoQuality) async {
+        let downloadFolder = preferences.downloadFolder
+        if !FileManager.default.isWritableFile(atPath: downloadFolder.path) {
+            statusMessage = "Download folder is not writable. Choose a different folder in settings."
+            return
+        }
+
+        isDownloading = true
+        statusMessage = "Downloading..."
+
+        do {
+            let result = try await downloader.download(sourceURL: sourceURL, destinationFolder: downloadFolder, quality: quality)
+            let thumbnailPath = try? await thumbnailGenerator.thumbnailPath(for: result.fileURL)
+            let item = DownloadItem(
+                sourceURL: sourceURL,
+                title: result.title,
+                filePath: result.fileURL.path,
+                thumbnailPath: thumbnailPath?.path,
+                createdAt: Date()
+            )
+
+            history.insert(item, at: 0)
+            let saved = historyStore.save(history)
+            ClipboardService.copyFile(result.fileURL)
+            activeTrimSession = ActiveTrimSession(item: item)
+            inputText = ""
+            statusMessage = saved ? "Downloaded and copied." : "Downloaded and copied. (History could not be saved.)"
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+
+        isDownloading = false
+    }
+
+    private func presentUpdateResult(
+        _ result: UpdateCheckResult,
+        downloadedUpdate: DownloadedUpdate?,
+        currentVersion: String,
+        manual: Bool
+    ) {
+        switch result {
+        case .upToDate:
+            guard manual else { return }
+            let alert = NSAlert()
+            alert.messageText = "MediaDownloader is up to date"
+            alert.informativeText = "You are running version \(currentVersion)."
+            alert.icon = NSImage(named: NSImage.applicationIconName)
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        case .updateAvailable(let update):
+            let alert = NSAlert()
+            alert.messageText = "MediaDownloader \(update.version) is ready"
+            alert.informativeText = downloadedUpdate == nil
+                ? "A new version is available. You are running \(currentVersion)."
+                : "The update has been downloaded in the background. You are running \(currentVersion)."
+            alert.icon = NSImage(named: NSImage.applicationIconName)
+            alert.addButton(withTitle: "Update")
+            alert.addButton(withTitle: "Later")
+
+            if alert.runModal() == .alertFirstButtonReturn {
+                if let downloadedUpdate {
+                    NSWorkspace.shared.open(downloadedUpdate.fileURL)
+                } else {
+                    NSWorkspace.shared.open(update.downloadURL ?? update.releaseURL)
+                }
+            }
+        }
+    }
+
+    private func presentUpdateError(_ error: Error) {
+        let alert = NSAlert()
+        alert.messageText = "Could not check for updates"
+        alert.informativeText = error.localizedDescription
+        alert.icon = NSImage(named: NSImage.applicationIconName)
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+}

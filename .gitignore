@@ -1,0 +1,17 @@
+.build/
+dist/
+.DS_Store
+*.xcuserdata
+DerivedData/
+
+# Local signing/notarization secrets
+.env
+.env.*
+!.env.example
+*.p8
+*.p12
+*.cer
+*.certSigningRequest
+*.mobileprovision
+*.provisionprofile
+*.key
